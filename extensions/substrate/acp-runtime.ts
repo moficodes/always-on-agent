@@ -109,6 +109,7 @@ export function createSubstrateAcpRuntime(config: SubstrateAcpRuntimeConfig): Ac
       const baseUrl =
         (input.handle as { actorUrl?: string }).actorUrl ?? urlForSession(input.handle.sessionKey);
       const turnActor = actorNameForConversation(input.handle.sessionKey);
+      const targetActor = `${config.atespace}/${turnActor}`;
       config.onTurnStart?.(turnActor);
       const abort = new AbortController();
       input.signal?.addEventListener("abort", () => abort.abort(input.signal?.reason));
@@ -123,6 +124,7 @@ export function createSubstrateAcpRuntime(config: SubstrateAcpRuntimeConfig): Ac
         abort.signal,
         resolveResult,
         config.replyPrefix,
+        targetActor,
       );
       return {
         requestId: input.requestId,
@@ -130,9 +132,19 @@ export function createSubstrateAcpRuntime(config: SubstrateAcpRuntimeConfig): Ac
         result,
         async cancel() {
           abort.abort("cancelled");
+          const routerUrl = process.env.ROUTER_URL || "http://atenet-router.ate-system.svc.cluster.local:80";
+          const killUrl = baseUrl.includes("actors.resources.substrate.ate.dev")
+            ? `${routerUrl}/sessions/${encodeURIComponent(actorSessionKey(input.handle.sessionKey))}/kill`
+            : `${baseUrl}/sessions/${encodeURIComponent(actorSessionKey(input.handle.sessionKey))}/kill`;
           await fetch(
-            `${baseUrl}/sessions/${encodeURIComponent(actorSessionKey(input.handle.sessionKey))}/kill`,
-            { method: "POST", headers: authHeaders() },
+            killUrl,
+            {
+              method: "POST",
+              headers: {
+                ...authHeaders(),
+                "ate-target-actor": targetActor,
+              },
+            },
           ).catch(() => {});
         },
         async closeStream() {
@@ -152,9 +164,21 @@ export function createSubstrateAcpRuntime(config: SubstrateAcpRuntimeConfig): Ac
     async cancel(input) {
       const baseUrl =
         (input.handle as { actorUrl?: string }).actorUrl ?? urlForSession(input.handle.sessionKey);
+      const turnActor = actorNameForConversation(input.handle.sessionKey);
+      const targetActor = `${config.atespace}/${turnActor}`;
+      const routerUrl = process.env.ROUTER_URL || "http://atenet-router.ate-system.svc.cluster.local:80";
+      const killUrl = baseUrl.includes("actors.resources.substrate.ate.dev")
+        ? `${routerUrl}/sessions/${encodeURIComponent(actorSessionKey(input.handle.sessionKey))}/kill`
+        : `${baseUrl}/sessions/${encodeURIComponent(actorSessionKey(input.handle.sessionKey))}/kill`;
       await fetch(
-        `${baseUrl}/sessions/${encodeURIComponent(actorSessionKey(input.handle.sessionKey))}/kill`,
-        { method: "POST", headers: authHeaders() },
+        killUrl,
+        {
+          method: "POST",
+          headers: {
+            ...authHeaders(),
+            "ate-target-actor": targetActor,
+          },
+        },
       ).catch(() => {});
     },
 
@@ -173,16 +197,23 @@ async function* streamTurn(
   signal: AbortSignal,
   resolveResult: (v: AcpRuntimeTurnResult) => void,
   replyPrefix?: string,
+  targetActor?: string,
 ): AsyncIterable<AcpRuntimeEvent> {
   let res: Response;
+  const routerUrl = process.env.ROUTER_URL || "http://atenet-router.ate-system.svc.cluster.local:80";
+  const requestUrl = baseUrl.includes("actors.resources.substrate.ate.dev")
+    ? `${routerUrl}/v1/chat/completions`
+    : `${baseUrl}/v1/chat/completions`;
+  const requestHeaders = {
+    "Content-Type": "application/json",
+    "X-OpenClaw-Session-Key": sessionKey,
+    ...(targetActor ? { "ate-target-actor": targetActor } : {}),
+    ...headers,
+  };
   try {
-    res = await fetch(`${baseUrl}/v1/chat/completions`, {
+    res = await fetch(requestUrl, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "X-OpenClaw-Session-Key": sessionKey,
-        ...headers,
-      },
+      headers: requestHeaders,
       body: JSON.stringify({
         messages: [{ role: "user", content: input.text }],
         stream: true,

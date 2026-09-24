@@ -22,6 +22,7 @@ const ATE_NS = "ate-system";
 const ATE_ENDPOINT = process.env.ATE_ENDPOINT || "api.ate-system.svc.cluster.local:443";
 const GATEWAY_URL = process.env.GATEWAY_URL || `http://openclaw-gateway.${NS}.svc.cluster.local:18789`;
 const KUBECTL_ATE = process.env.KUBECTL_ATE || "kubectl-ate";
+const ROUTER_URL = process.env.ROUTER_URL || "http://atenet-router.ate-system.svc.cluster.local:80";
 // Atespace(s) the demo actors live in (current OSS actor model). Comma-separated.
 const ATESPACES = (process.env.ATESPACES || "openclaw-demo").split(",").map(s => s.trim()).filter(Boolean);
 
@@ -480,7 +481,7 @@ function reportRefusals() {
 }
 
 async function churnActor(name, atespace, hold) {
-  const url = `http://${name}.${atespace}.actors.resources.substrate.ate.dev/healthz`;
+  const url = `${ROUTER_URL}/healthz`;
   // Start somewhere random inside the cycle so twenty loops do not fire on the
   // same tick. Without this they synchronise into a slow pulse, which looks
   // staged and hides the refusals.
@@ -488,7 +489,10 @@ async function churnActor(name, atespace, hold) {
   while (!churn.stop && Date.now() < churn.until) {
     let served = false;
     try {
-      const r = await fetch(url, { signal: AbortSignal.timeout(30000) });
+      const r = await fetch(url, {
+        headers: { "ate-target-actor": `${atespace}/${name}` },
+        signal: AbortSignal.timeout(30000),
+      });
       if (r.ok) served = true;
       else if (r.status === 503) churn.refused++;
     } catch {}
@@ -527,7 +531,7 @@ app.post("/api/churn", async (c) => {
   for (let i = 1; i <= count; i++) {
     const name = `oc-agent-${i}`;
     await runCmd(
-      `${KUBECTL_ATE} create actor ${name} -a ${atespace} --template-ref openclaw-agent 2>/dev/null || true`,
+      `${KUBECTL_ATE} create actor ${name} -a ${atespace} --template-ref openclaw-agent 2>/dev/null || ${KUBECTL_ATE} create actor ${name} -a ${atespace} --template openclaw-agent 2>/dev/null || true`,
       15000
     );
     names.push(name);
@@ -583,9 +587,27 @@ app.post("/api/churn", async (c) => {
   return c.json({ ok: true, count, seconds, hold, actors: names });
 });
 
-app.post("/api/churn/stop", (c) => {
+app.post("/api/churn/stop", async (c) => {
   churn.stop = true;
-  return c.json({ ok: true, wasRunning: churn.running, cycles: churn.cycles });
+  const wasRunning = churn.running;
+  churn.running = false;
+  const atespace = ATESPACES[0] || "openclaw-demo";
+  addEvent("substrate", "Stop requested: parking all actors in the fleet…");
+  (async () => {
+    try {
+      for (let pass = 0; pass < 2; pass++) {
+        for (let i = 1; i <= FLEET_SIZE; i++) {
+          await runCmd(`${KUBECTL_ATE} suspend actor oc-agent-${i} -a ${atespace} 2>/dev/null || true`, 15000);
+        }
+        await runCmd(`${KUBECTL_ATE} suspend actor oc-agent -a ${atespace} 2>/dev/null || true`, 15000);
+        if (pass === 0) await sleep(2000);
+      }
+      addEvent("substrate", "Stop: fleet parked (all actors suspended)");
+    } catch (err) {
+      addEvent("substrate", `Stop error: ${err.message}`);
+    }
+  })();
+  return c.json({ ok: true, wasRunning, cycles: churn.cycles });
 });
 
 // Burst: create N logical actors and fire an agent task at each, to demonstrate
@@ -614,21 +636,24 @@ app.post("/api/burst", async (c) => {
     // HTTP requests at actors that had never been created, and the pod map stayed
     // empty while the button reported success.
     await runCmd(
-      `${KUBECTL_ATE} create actor ${name} -a ${atespace} --template-ref openclaw-agent 2>/dev/null || true`,
+      `${KUBECTL_ATE} create actor ${name} -a ${atespace} --template-ref openclaw-agent 2>/dev/null || ${KUBECTL_ATE} create actor ${name} -a ${atespace} --template openclaw-agent 2>/dev/null || true`,
       15000
     );
     names.push(name);
   }
   // Fire resume-on-demand at each actor (async, so it doesn't block the HTTP response).
-  // atenet routes <actor>.<atespace>.actors.resources.substrate.ate.dev to a worker.
+  // atenet routes to a worker via ate-target-actor header.
   for (const name of names) {
-    const url = `http://${name}.${atespace}.actors.resources.substrate.ate.dev/healthz`;
+    const url = `${ROUTER_URL}/healthz`;
     // This request is what causes the wake, and the response is the actor
     // serving, so the round trip is the resume-on-demand latency with nothing
     // inferred. It is the only place in the dashboard that can honestly time a
     // resume: everywhere else is reading a 2s poll.
     const t0 = Date.now();
-    fetch(url, { signal: AbortSignal.timeout(120000) })
+    fetch(url, {
+      headers: { "ate-target-actor": `${atespace}/${name}` },
+      signal: AbortSignal.timeout(120000),
+    })
       .then((r) => {
         // Only a served response is a sample. A 503 measures how fast the pool
         // said no, and a 504 is the timeout, not the restore.
@@ -662,7 +687,9 @@ app.post("/api/burst", async (c) => {
           addEvent("substrate", `${name}: resume request failed HTTP ${r.status}`);
         }
       })
-      .catch(() => {});
+      .catch((err) => {
+        addEvent("substrate", `${name}: network error: ${err.message}`);
+      });
   }
   addEvent("substrate", `Burst: fired ${count} tasks, actors now multiplexing onto the worker pool`);
   return c.json({ ok: true, count, actors: names });

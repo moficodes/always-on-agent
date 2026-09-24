@@ -160,9 +160,15 @@ render "$PARENT_DIR/manifests/workerpool.yaml"    | kubectl apply -f -
 # (there is no update verb), so a re-run that changes the image, bucket or key
 # has to delete and recreate.
 kubectl ate create atespace "$ATESPACE" 2>/dev/null || echo "    atespace $ATESPACE exists, continuing..."
+TEMPLATE_REPLACED=false
 if kubectl ate get actor-template "$TEMPLATE" -a "$ATESPACE" &>/dev/null; then
   echo "    Replacing existing actor template (templates are immutable)..."
   kubectl ate delete actor-template "$TEMPLATE" -a "$ATESPACE"
+  TEMPLATE_REPLACED=true
+  if kubectl ate get actor "$ACTOR_NAME" -a "$ATESPACE" &>/dev/null; then
+    echo "    Deleting existing actor $ACTOR_NAME to avoid orphaned snapshot reference..."
+    kubectl ate delete actor "$ACTOR_NAME" -a "$ATESPACE"
+  fi
 fi
 render "$PARENT_DIR/manifests/actortemplate.yaml" | kubectl ate create actor-template -f -
 
@@ -205,10 +211,10 @@ golden_ready() {
   local deadline=$((SECONDS + 420)) json snapshot err
   while ((SECONDS < deadline)); do
     if json=$(kubectl ate get actor-template "$TEMPLATE" -a "$ATESPACE" -o json 2>/dev/null); then
-      # ExternalSnapshot identifies itself by URI; there is no name field.
-      snapshot=$(jq -r '.actorTemplates[0].status.goldenSnapshotStatus.goldenSnapshot.snapshotUri // empty' <<<"$json")
+      # Golden snapshot is identified by goldenTag or snapshotUri.
+      snapshot=$(jq -r '(.status.goldenSnapshotStatus.goldenTag.name // .status.goldenSnapshotStatus.goldenSnapshot.snapshotUri // .actorTemplates[0].status.goldenSnapshotStatus.goldenSnapshot.snapshotUri // empty)' <<<"$json")
       [ -n "$snapshot" ] && { echo "    golden snapshot ready: $snapshot"; return 0; }
-      err=$(jq -r '.actorTemplates[0].status.goldenSnapshotStatus.errorMessage // empty' <<<"$json")
+      err=$(jq -r '(.status.goldenSnapshotStatus.errorMessage // .actorTemplates[0].status.goldenSnapshotStatus.errorMessage // empty)' <<<"$json")
       [ -n "$err" ] && { echo "    golden snapshot FAILED: $err" >&2; return 1; }
     fi
     sleep 5
@@ -217,8 +223,18 @@ golden_ready() {
   return 1
 }
 golden_ready || echo "    (continuing anyway, the actor will resume once the golden is ready)"
+# If the template was replaced or actor references a stale template UID, ensure
+# actor is deleted and recreated so it never points to an orphaned snapshot URI.
+if kubectl ate get actor "$ACTOR_NAME" -a "$ATESPACE" &>/dev/null; then
+  tpl_uid=$(kubectl ate get actor-template "$TEMPLATE" -a "$ATESPACE" -o json 2>/dev/null | jq -r '.metadata.uid // empty')
+  actor_tpl_uid=$(kubectl ate get actor "$ACTOR_NAME" -a "$ATESPACE" -o json 2>/dev/null | jq -r '.status.currentActorTemplateUid // empty')
+  if [ "$TEMPLATE_REPLACED" = "true" ] || { [ -n "$tpl_uid" ] && [ -n "$actor_tpl_uid" ] && [ "$tpl_uid" != "$actor_tpl_uid" ]; }; then
+    echo "    Recreating actor $ACTOR_NAME to bind to current template golden snapshot..."
+    kubectl ate delete actor "$ACTOR_NAME" -a "$ATESPACE"
+  fi
+fi
 # The template is resolved in the actor's atespace, so both live in $ATESPACE.
-kubectl ate create actor "$ACTOR_NAME" --template-ref "$TEMPLATE" --atespace "$ATESPACE" 2>/dev/null \
+kubectl ate create actor "$ACTOR_NAME" --template "$TEMPLATE" --atespace "$ATESPACE" 2>/dev/null \
   || echo "    actor exists, continuing..."
 
 # --- [7b] Optional cron status pings (run on the always-on gateway agent) ---
