@@ -44,6 +44,8 @@ export function createKubectlAteClient(cfg: { binPath?: string; endpoint?: strin
         await run([
           "create", "actor", ref.name,
           "-a", ref.atespace,
+          // release-0.1 spells it --template-ref; main renamed it to --template
+          // (substrate#1536). Both resolve a bare name inside the actor's atespace.
           "--template-ref", templateName,
         ]);
       } catch (err) {

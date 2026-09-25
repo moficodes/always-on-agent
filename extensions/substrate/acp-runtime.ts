@@ -27,7 +27,7 @@ import type {
   AcpRuntimeTurnInput,
   AcpRuntimeTurnResult,
 } from "openclaw/plugin-sdk/acp-runtime-backend";
-import { actorNameForConversation, actorUrlFor, DEFAULT_ACTOR_DOMAIN } from "./actor-router.js";
+import { actorNameForConversation, DEFAULT_ACTOR_DOMAIN, fetchActor, type ActorRef } from "./actor-router.js";
 import type { Provisioner } from "./actor-provisioner.js";
 
 export type SubstrateAcpRuntimeConfig = {
@@ -75,9 +75,12 @@ export function createSubstrateAcpRuntime(config: SubstrateAcpRuntimeConfig): Ac
   const templateFor = (agent?: string): string =>
     (agent && config.templateForAgent?.[agent]) || config.template;
   // Placement is a pure function of the conversation key, so both ensureSession
-  // and startTurn derive the same actor URL with no side map.
-  const urlForSession = (sessionKey: string): string =>
-    actorUrlFor(actorNameForConversation(sessionKey), config.atespace, domain);
+  // and startTurn derive the same actor with no side map.
+  const refForSession = (sessionKey: string): ActorRef => ({
+    name: actorNameForConversation(sessionKey),
+    atespace: config.atespace,
+    domain,
+  });
   // The gateway's ACP session key uses reserved internal namespaces
   // (e.g. "agent:main:acp:binding:..."), which the actor's
   // /v1/chat/completions rejects via X-OpenClaw-Session-Key ("reserved
@@ -85,6 +88,11 @@ export function createSubstrateAcpRuntime(config: SubstrateAcpRuntimeConfig): Ac
   // key the in-actor session by the (stable, non-reserved) actor name instead.
   const actorSessionKey = (sessionKey: string): string =>
     actorNameForConversation(sessionKey);
+  const killSession = (sessionKey: string): Promise<unknown> =>
+    fetchActor(refForSession(sessionKey), `/sessions/${encodeURIComponent(actorSessionKey(sessionKey))}/kill`, {
+      method: "POST",
+      headers: authHeaders(),
+    }).catch(() => {});
 
   const runtime: AcpRuntime = {
     async ensureSession(input: AcpRuntimeEnsureInput): Promise<AcpRuntimeHandle> {
@@ -99,17 +107,12 @@ export function createSubstrateAcpRuntime(config: SubstrateAcpRuntimeConfig): Ac
         backend: "substrate",
         runtimeSessionName: input.sessionKey,
         cwd: input.cwd,
-        // Stash the resolved URL on the handle; startTurn also recomputes it.
-        ...({ actorUrl: urlForSession(input.sessionKey) } as object),
       };
     },
 
     startTurn(input: AcpRuntimeTurnInput): AcpRuntimeTurn {
-      // Deterministic from the conversation key; handle carries it as a fast path.
-      const baseUrl =
-        (input.handle as { actorUrl?: string }).actorUrl ?? urlForSession(input.handle.sessionKey);
-      const turnActor = actorNameForConversation(input.handle.sessionKey);
-      const targetActor = `${config.atespace}/${turnActor}`;
+      const actor = refForSession(input.handle.sessionKey);
+      const turnActor = actor.name;
       config.onTurnStart?.(turnActor);
       const abort = new AbortController();
       input.signal?.addEventListener("abort", () => abort.abort(input.signal?.reason));
@@ -117,14 +120,13 @@ export function createSubstrateAcpRuntime(config: SubstrateAcpRuntimeConfig): Ac
       const result = new Promise<AcpRuntimeTurnResult>((r) => (resolveResult = r));
       result.finally(() => config.onTurnEnd?.(turnActor)).catch(() => {});
       const events = streamTurn(
-        baseUrl,
+        actor,
         input,
         actorSessionKey(input.handle.sessionKey),
         authHeaders(),
         abort.signal,
         resolveResult,
         config.replyPrefix,
-        targetActor,
       );
       return {
         requestId: input.requestId,
@@ -132,20 +134,7 @@ export function createSubstrateAcpRuntime(config: SubstrateAcpRuntimeConfig): Ac
         result,
         async cancel() {
           abort.abort("cancelled");
-          const routerUrl = process.env.ROUTER_URL || "http://atenet-router.ate-system.svc.cluster.local:80";
-          const killUrl = baseUrl.includes("actors.resources.substrate.ate.dev")
-            ? `${routerUrl}/sessions/${encodeURIComponent(actorSessionKey(input.handle.sessionKey))}/kill`
-            : `${baseUrl}/sessions/${encodeURIComponent(actorSessionKey(input.handle.sessionKey))}/kill`;
-          await fetch(
-            killUrl,
-            {
-              method: "POST",
-              headers: {
-                ...authHeaders(),
-                "ate-target-actor": targetActor,
-              },
-            },
-          ).catch(() => {});
+          await killSession(input.handle.sessionKey);
         },
         async closeStream() {
           abort.abort("stream closed");
@@ -162,24 +151,7 @@ export function createSubstrateAcpRuntime(config: SubstrateAcpRuntimeConfig): Ac
     },
 
     async cancel(input) {
-      const baseUrl =
-        (input.handle as { actorUrl?: string }).actorUrl ?? urlForSession(input.handle.sessionKey);
-      const turnActor = actorNameForConversation(input.handle.sessionKey);
-      const targetActor = `${config.atespace}/${turnActor}`;
-      const routerUrl = process.env.ROUTER_URL || "http://atenet-router.ate-system.svc.cluster.local:80";
-      const killUrl = baseUrl.includes("actors.resources.substrate.ate.dev")
-        ? `${routerUrl}/sessions/${encodeURIComponent(actorSessionKey(input.handle.sessionKey))}/kill`
-        : `${baseUrl}/sessions/${encodeURIComponent(actorSessionKey(input.handle.sessionKey))}/kill`;
-      await fetch(
-        killUrl,
-        {
-          method: "POST",
-          headers: {
-            ...authHeaders(),
-            "ate-target-actor": targetActor,
-          },
-        },
-      ).catch(() => {});
+      await killSession(input.handle.sessionKey);
     },
 
     async close() {
@@ -190,30 +162,23 @@ export function createSubstrateAcpRuntime(config: SubstrateAcpRuntimeConfig): Ac
 }
 
 async function* streamTurn(
-  baseUrl: string,
+  actor: ActorRef,
   input: AcpRuntimeTurnInput,
   sessionKey: string,
   headers: Record<string, string>,
   signal: AbortSignal,
   resolveResult: (v: AcpRuntimeTurnResult) => void,
   replyPrefix?: string,
-  targetActor?: string,
 ): AsyncIterable<AcpRuntimeEvent> {
   let res: Response;
-  const routerUrl = process.env.ROUTER_URL || "http://atenet-router.ate-system.svc.cluster.local:80";
-  const requestUrl = baseUrl.includes("actors.resources.substrate.ate.dev")
-    ? `${routerUrl}/v1/chat/completions`
-    : `${baseUrl}/v1/chat/completions`;
-  const requestHeaders = {
-    "Content-Type": "application/json",
-    "X-OpenClaw-Session-Key": sessionKey,
-    ...(targetActor ? { "ate-target-actor": targetActor } : {}),
-    ...headers,
-  };
   try {
-    res = await fetch(requestUrl, {
+    res = await fetchActor(actor, "/v1/chat/completions", {
       method: "POST",
-      headers: requestHeaders,
+      headers: {
+        "Content-Type": "application/json",
+        "X-OpenClaw-Session-Key": sessionKey,
+        ...headers,
+      },
       body: JSON.stringify({
         messages: [{ role: "user", content: input.text }],
         stream: true,
